@@ -1,0 +1,253 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+skip_system=1
+dry_run=0
+check_only=0
+yes=0
+use_sudo=auto
+
+usage() {
+  cat <<'EOF'
+Usage: npm-paru [options]
+
+Update globally installed npm packages, with paru-like "check then upgrade" flow.
+
+Options:
+  -c, --check             Only show outdated global packages
+  -n, --dry-run           Show selected updates without installing them
+  -y, --yes               Do not prompt before updating
+      --include-system    Also update npm/node-gyp/nopt/semver if outdated
+      --no-sudo           Never use sudo, even if the npm prefix is not writable
+  -h, --help              Show this help
+
+Notes:
+  By default this skips npm's distro-managed support packages:
+  npm, node-gyp, nopt, semver.
+
+  Size columns use npm registry unpacked size metadata. This is an estimate:
+  actual disk usage can differ after dependency flattening/deduping.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    -c|--check)
+      check_only=1
+      ;;
+    -n|--dry-run)
+      dry_run=1
+      ;;
+    -y|--yes)
+      yes=1
+      ;;
+    --include-system)
+      skip_system=0
+      ;;
+    --no-sudo)
+      use_sudo=never
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$1" >&2
+    exit 127
+  fi
+}
+
+require_cmd npm
+require_cmd node
+
+npm_prefix="$(npm prefix -g)"
+outdated_json="$(npm outdated -g --json 2>/dev/null || true)"
+
+if [[ -z "$outdated_json" || "$outdated_json" == "{}" ]]; then
+  printf 'All global npm packages are up to date.\n'
+  exit 0
+fi
+
+tmp_json="$(mktemp)"
+trap 'rm -f "$tmp_json"' EXIT
+printf '%s\n' "$outdated_json" > "$tmp_json"
+
+node_script='
+const fs = require("fs");
+const { execFileSync } = require("child_process");
+const data = JSON.parse(fs.readFileSync(process.argv[1], "utf8") || "{}");
+const skipSystem = process.argv[2] === "1";
+const system = new Set(["npm", "node-gyp", "nopt", "semver"]);
+
+function viewUnpackedSize(spec) {
+  try {
+    const out = execFileSync("npm", ["view", spec, "dist.unpackedSize", "--json"], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+    if (!out) return null;
+    const parsed = JSON.parse(out);
+    return typeof parsed === "number" ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatBytes(value) {
+  if (value === null || value === undefined || Number.isNaN(value)) return "?";
+  const units = ["B", "KiB", "MiB", "GiB"];
+  let size = Math.abs(value);
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit++;
+  }
+  const sign = value < 0 ? "-" : "";
+  const decimals = unit === 0 ? 0 : size >= 10 ? 1 : 2;
+  return `${sign}${size.toFixed(decimals)} ${units[unit]}`;
+}
+
+function pad(value, width) {
+  value = String(value);
+  return value + " ".repeat(Math.max(0, width - value.length));
+}
+
+const rows = Object.entries(data).map(([name, info]) => {
+  const current = info.current || "?";
+  const latest = info.latest || "?";
+  const currentSize = viewUnpackedSize(`${name}@${current}`);
+  const latestSize = viewUnpackedSize(`${name}@${latest}`);
+  return {
+    name,
+    current,
+    latest,
+    currentSize,
+    latestSize,
+    delta: currentSize === null || latestSize === null ? null : latestSize - currentSize,
+    skipped: skipSystem && system.has(name),
+  };
+});
+
+const printable = rows.map((row) => ({
+  action: row.skipped ? "skip" : "up",
+  package: row.name,
+  current: row.current,
+  latest: row.latest,
+  currentSize: formatBytes(row.currentSize),
+  latestSize: formatBytes(row.latestSize),
+  change: row.delta === null ? "?" : `${row.delta >= 0 ? "+" : ""}${formatBytes(row.delta)}`,
+}));
+
+const headers = {
+  action: "Action",
+  package: "Package",
+  current: "Current",
+  latest: "Latest",
+  currentSize: "Current Size",
+  latestSize: "Latest Size",
+  change: "Net Change",
+};
+
+const widths = {};
+for (const key of Object.keys(headers)) {
+  widths[key] = Math.max(headers[key].length, ...printable.map((row) => row[key].length));
+}
+
+console.log(
+  [
+    pad(headers.action, widths.action),
+    pad(headers.package, widths.package),
+    pad(headers.current, widths.current),
+    pad(headers.latest, widths.latest),
+    pad(headers.currentSize, widths.currentSize),
+    pad(headers.latestSize, widths.latestSize),
+    pad(headers.change, widths.change),
+  ].join("  ")
+);
+
+console.log(
+  [
+    "-".repeat(widths.action),
+    "-".repeat(widths.package),
+    "-".repeat(widths.current),
+    "-".repeat(widths.latest),
+    "-".repeat(widths.currentSize),
+    "-".repeat(widths.latestSize),
+    "-".repeat(widths.change),
+  ].join("  ")
+);
+
+for (const row of printable) {
+  console.log(
+    [
+      pad(row.action, widths.action),
+      pad(row.package, widths.package),
+      pad(row.current, widths.current),
+      pad(row.latest, widths.latest),
+      pad(row.currentSize, widths.currentSize),
+      pad(row.latestSize, widths.latestSize),
+      pad(row.change, widths.change),
+    ].join("  ")
+  );
+}
+
+const targets = rows
+  .filter((row) => !row.skipped)
+  .map((row) => `${row.name}@latest`);
+
+if (targets.length) {
+  console.error(`__TARGETS__${JSON.stringify(targets)}`);
+}
+'
+
+printf 'Global npm updates available:\n'
+node_output="$(node -e "$node_script" "$tmp_json" "$skip_system" 2>&1)"
+printf '%s\n' "$node_output" | sed '/^__TARGETS__/d; s/^/  /'
+
+targets_json="$(printf '%s\n' "$node_output" | sed -n 's/^__TARGETS__//p' | tail -n 1)"
+if [[ -z "$targets_json" ]]; then
+  printf '\nNothing selected for update. Use --include-system to include skipped packages.\n'
+  exit 0
+fi
+
+mapfile -t targets < <(node -e 'for (const item of JSON.parse(process.argv[1])) console.log(item)' "$targets_json")
+
+if ((check_only)); then
+  exit 1
+fi
+
+cmd=(npm install -g "${targets[@]}")
+if [[ "$use_sudo" == auto && ! -w "$npm_prefix" ]]; then
+  require_cmd sudo
+  cmd=(sudo "${cmd[@]}")
+fi
+
+if ((dry_run)); then
+  printf '\nDry run: packages selected for update, but no changes were made.\n'
+  exit 0
+fi
+
+if ((!yes)); then
+  printf '\n'
+  read -r -p "Update global npm packages? [Y/n] " answer
+  case "$answer" in
+    ""|y|Y|yes|YES)
+      ;;
+    *)
+      printf 'Aborted.\n'
+      exit 1
+      ;;
+  esac
+fi
+
+"${cmd[@]}"

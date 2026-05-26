@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+check_only=0
+dry_run=0
+yes=0
+no_size=0
+
+usage() {
+  cat <<'EOF'
+Usage: go-paru [options]
+
+Update Go CLIs installed in GOBIN/GOPATH/bin, with paru-like preview.
+
+Options:
+  -c, --check      Only show outdated Go binaries
+  -n, --dry-run    Show selected updates without installing them
+  -y, --yes        Do not prompt before updating
+      --no-size    Skip latest binary builds and hide size-change columns
+  -h, --help       Show this help
+
+Notes:
+  Go does not keep a global package database. This script discovers binaries,
+  reads embedded module metadata with "go version -m", and updates with:
+  go install <package-path>@latest
+
+  Size changes are exact binary-size changes, calculated by building latest
+  versions into a temporary directory before asking for confirmation.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    -c|--check)
+      check_only=1
+      ;;
+    -n|--dry-run)
+      dry_run=1
+      ;;
+    -y|--yes)
+      yes=1
+      ;;
+    --no-size)
+      no_size=1
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+  shift
+done
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    printf 'Missing required command: %s\n' "$1" >&2
+    exit 127
+  fi
+}
+
+format_bytes() {
+  local bytes="$1"
+  awk -v bytes="$bytes" '
+    function abs(n) { return n < 0 ? -n : n }
+    BEGIN {
+      split("B KiB MiB GiB", units, " ")
+      sign = bytes < 0 ? "-" : ""
+      size = abs(bytes)
+      unit = 1
+      while (size >= 1024 && unit < 4) {
+        size /= 1024
+        unit++
+      }
+      if (unit == 1) {
+        printf "%s%.0f %s", sign, size, units[unit]
+      } else if (size >= 10) {
+        printf "%s%.1f %s", sign, size, units[unit]
+      } else {
+        printf "%s%.2f %s", sign, size, units[unit]
+      }
+    }
+  '
+}
+
+print_table() {
+  if ((no_size)); then
+    printf '%-6s  %-38s  %-14s  %-14s\n' "Action" "Package" "Current" "Latest"
+    printf '%-6s  %-38s  %-14s  %-14s\n' "------" "-------" "-------" "------"
+    for row in "${rows[@]}"; do
+      IFS=$'\t' read -r action name current latest _current_size _latest_size _delta _pkg_path _bin_path _tmp_bin <<<"$row"
+      printf '%-6s  %-38s  %-14s  %-14s\n' "$action" "$name" "$current" "$latest"
+    done
+  else
+    printf '%-6s  %-38s  %-14s  %-14s  %-12s  %-12s  %-10s\n' "Action" "Package" "Current" "Latest" "Current Size" "Latest Size" "Net Change"
+    printf '%-6s  %-38s  %-14s  %-14s  %-12s  %-12s  %-10s\n' "------" "-------" "-------" "------" "------------" "-----------" "----------"
+    for row in "${rows[@]}"; do
+      IFS=$'\t' read -r action name current latest current_size latest_size delta _pkg_path _bin_path _tmp_bin <<<"$row"
+      if [[ "$latest_size" == "?" ]]; then
+        latest_display="?"
+        delta_display="?"
+      else
+        latest_display="$(format_bytes "$latest_size")"
+        if ((delta >= 0)); then
+          delta_display="+$(format_bytes "$delta")"
+        else
+          delta_display="$(format_bytes "$delta")"
+        fi
+      fi
+      printf '%-6s  %-38s  %-14s  %-14s  %-12s  %-12s  %-10s\n' \
+        "$action" "$name" "$current" "$latest" "$(format_bytes "$current_size")" "$latest_display" "$delta_display"
+    done
+  fi
+}
+
+require_cmd go
+
+gobin="$(go env GOBIN)"
+if [[ -z "$gobin" ]]; then
+  gobin="$(go env GOPATH)/bin"
+fi
+
+if [[ ! -d "$gobin" ]]; then
+  printf 'Go binary directory does not exist: %s\n' "$gobin" >&2
+  exit 1
+fi
+
+tmp_dir=""
+if ((!no_size)); then
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+fi
+
+rows=()
+
+while IFS= read -r bin_path; do
+  metadata="$(go version -m "$bin_path" 2>/dev/null || true)"
+  pkg_path="$(awk '$1 == "path" { print $2; exit }' <<<"$metadata")"
+  read -r module_path current_version < <(awk '$1 == "mod" { print $2, $3; exit }' <<<"$metadata")
+
+  if [[ -z "${pkg_path:-}" || -z "${module_path:-}" || -z "${current_version:-}" || "$current_version" == "(devel)" ]]; then
+    continue
+  fi
+
+  latest_json="$(go list -m -json "${module_path}@latest" 2>/dev/null || true)"
+  latest_version="$(awk -F\" '$2 == "Version" { print $4; exit }' <<<"$latest_json")"
+  if [[ -z "$latest_version" || "$latest_version" == "$current_version" ]]; then
+    continue
+  fi
+
+  current_size="$(stat -c '%s' "$bin_path")"
+  latest_size="?"
+  delta=0
+  tmp_bin=""
+
+  if ((!no_size)); then
+    if GOBIN="$tmp_dir" go install "${pkg_path}@latest" >/dev/null 2>&1; then
+      tmp_bin="$tmp_dir/$(basename "$pkg_path")"
+      if [[ -f "$tmp_bin" ]]; then
+        latest_size="$(stat -c '%s' "$tmp_bin")"
+        delta=$((latest_size - current_size))
+      fi
+    fi
+  fi
+
+  rows+=("up"$'\t'"$(basename "$pkg_path")"$'\t'"$current_version"$'\t'"$latest_version"$'\t'"$current_size"$'\t'"$latest_size"$'\t'"$delta"$'\t'"$pkg_path"$'\t'"$bin_path"$'\t'"$tmp_bin")
+done < <(find "$gobin" -maxdepth 1 -type f -executable | sort)
+
+if ((${#rows[@]} == 0)); then
+  printf 'All Go CLIs in %s are up to date.\n' "$gobin"
+  exit 0
+fi
+
+printf 'Go CLI updates available from %s:\n' "$gobin"
+print_table
+
+if ((check_only)); then
+  exit 1
+fi
+
+if ((dry_run)); then
+  printf '\nDry run: packages selected for update, but no changes were made.\n'
+  exit 0
+fi
+
+if ((!yes)); then
+  printf '\n'
+  read -r -p "Update Go CLIs? [Y/n] " answer
+  case "$answer" in
+    ""|y|Y|yes|YES)
+      ;;
+    *)
+      printf 'Aborted.\n'
+      exit 1
+      ;;
+  esac
+fi
+
+for row in "${rows[@]}"; do
+  IFS=$'\t' read -r _action name _current _latest _current_size _latest_size _delta pkg_path bin_path tmp_bin <<<"$row"
+  printf 'Updating %s...\n' "$name"
+  if [[ -n "$tmp_bin" && -f "$tmp_bin" ]]; then
+    install -m 0755 "$tmp_bin" "$bin_path"
+  else
+    go install "${pkg_path}@latest"
+  fi
+done
